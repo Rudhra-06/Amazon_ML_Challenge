@@ -1,5 +1,6 @@
 import sys
 import os
+import time
 sys.path.insert(0, os.path.abspath("."))
 
 import pandas as pd
@@ -119,10 +120,65 @@ def test_blocking_strategies():
         print(f"  Max Candidates:      {report['max_candidates']}")
         print(f"  Reduction Ratio:     {report['reduction_ratio']}")
         print("-" * 50)
+        
+        # Verify candidate dictionary output structure and types
+        cands = strat.generate_candidates(s1_prep)
+        assert isinstance(cands, dict)
+        for s1_id, match_set in cands.items():
+            assert isinstance(match_set, set)
+            for m in match_set:
+                assert isinstance(m, str)
 
     print("Blocking tests passed successfully!\n")
+
+
+def test_synthetic_scale():
+    print("=== Testing Scale & Memory Efficiency (1,000,000 synthetic records) ===")
+    n_records = 1_000_000
+    
+    s1_mock = pd.DataFrame({
+        "entity_id": [f"S1_{i}" for i in range(5000)],
+        "business_name": [f"Company {i % 5000} LLC" for i in range(5000)],
+        "business_address": [f"{i % 2000} Main St" for i in range(5000)],
+        "country": ["USA" if i % 2 == 0 else "DEU" for i in range(5000)]
+    })
+    
+    s2_mock = pd.DataFrame({
+        "entity_id": [f"S2_{i}" for i in range(n_records // 2)],
+        "business_name": [f"Company {i % 5000} Inc" for i in range(n_records // 2)],
+        "business_address": [f"{i % 2000} Main Street" for i in range(n_records // 2)],
+        "country": ["USA" if i % 2 == 0 else "DEU" for i in range(n_records // 2)]
+    })
+    
+    s3_mock = pd.DataFrame({
+        "entity_id": [f"S3_{i}" for i in range(n_records // 2)],
+        "business_name": [f"Company {i % 5000}" for i in range(n_records // 2)],
+        "business_address": [f"{i % 2000} Main St" for i in range(n_records // 2)],
+        "country": ["USA" if i % 2 == 0 else "DEU" for i in range(n_records // 2)]
+    })
+    
+    s1_prep = preprocess_dataframe(s1_mock, strip_legal=True)
+    s2_prep = preprocess_dataframe(s2_mock, strip_legal=True)
+    s3_prep = preprocess_dataframe(s3_mock, strip_legal=True)
+    
+    t0 = time.time()
+    blocker = ExactNameCountryBlocking()
+    blocker.build_index([s2_prep, s3_prep])
+    t_index = time.time() - t0
+    
+    t0 = time.time()
+    cands = blocker.generate_candidates(s1_prep)
+    t_cands = time.time() - t0
+    
+    print(f"1M target records index build time: {t_index:.4f}s")
+    print(f"5,000 S1 candidate generation time: {t_cands:.4f}s")
+    print(f"Target IDs array size: {len(blocker.target_entity_ids)}")
+    assert len(blocker.target_entity_ids) == n_records
+    assert len(cands) == 5000
+    print("Scale test passed successfully!\n")
 
 
 if __name__ == "__main__":
     test_preprocessing()
     test_blocking_strategies()
+    test_synthetic_scale()

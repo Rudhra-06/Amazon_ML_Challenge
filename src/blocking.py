@@ -3,10 +3,12 @@ Blocking module for Business Entity Resolution.
 
 Supports several independently testable blocking strategies and evaluation functions
 to measure blocking recall, candidate statistics, and reduction ratio.
+Memory-optimized using contiguous target entity ID arrays and compact int32 inverted indices.
 """
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
+import gc
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Set, Tuple, Any, Optional
@@ -29,13 +31,16 @@ class BaseBlockingStrategy(ABC):
     """
     Abstract base class for independent blocking strategies.
     
-    Each blocking strategy implements `extract_keys(row)` which returns
-    one or more string blocking keys for an entity record.
+    Memory-optimized:
+    - Target entity IDs are stored once in a contiguous 1D NumPy array (`target_entity_ids`).
+    - The inverted index maps blocking keys to compact int32 NumPy arrays (`inverted_index`).
     """
     
-    def __init__(self, name: str):
+    def __init__(self, name: str, max_candidates_per_key: Optional[int] = None):
         self.name = name
-        self.inverted_index: Dict[str, List[str]] = defaultdict(list)
+        self.max_candidates_per_key = max_candidates_per_key
+        self.target_entity_ids: np.ndarray = np.array([], dtype=object)
+        self.inverted_index: Dict[str, np.ndarray] = {}
         
     @abstractmethod
     def extract_keys(self, row: pd.Series) -> List[str]:
@@ -44,33 +49,56 @@ class BaseBlockingStrategy(ABC):
 
     def build_index(self, target_dfs: List[pd.DataFrame]) -> None:
         """
-        Build inverted index key -> list of target entity IDs (S2 / S3 records).
-        Memory-conscious iteration over target dataframes.
+        Build memory-compact inverted index key -> np.ndarray(int32).
+        Stores target entity IDs in a single contiguous 1D array to minimize RAM overhead.
         """
         self.inverted_index.clear()
         
+        all_ids_list = []
+        key_builder = defaultdict(list)
+        
+        offset = 0
         for df in target_dfs:
-            # Ensure normalized columns exist
+            id_col = "entity_id"
             name_col = "norm_name" if "norm_name" in df.columns else "business_name"
             addr_col = "norm_address" if "norm_address" in df.columns else "business_address"
             country_col = "norm_country" if "norm_country" in df.columns else "country"
-            id_col = "entity_id"
             
-            for row in df[[id_col, name_col, addr_col, country_col]].itertuples(index=False):
-                ent_id, norm_name, norm_addr, norm_country = row
-                
-                # Build pseudo-series for key extraction
+            ids = df[id_col].fillna("").astype(str).to_numpy()
+            names = df[name_col].fillna("").astype(str).to_numpy()
+            addrs = df[addr_col].fillna("").astype(str).to_numpy()
+            countries = df[country_col].fillna("").astype(str).to_numpy()
+            
+            all_ids_list.append(ids)
+            
+            for idx, (ent_id, norm_name, norm_addr, norm_country) in enumerate(zip(ids, names, addrs, countries)):
                 item = {
                     "entity_id": ent_id,
-                    "norm_name": norm_name if isinstance(norm_name, str) else "",
-                    "norm_address": norm_addr if isinstance(norm_addr, str) else "",
-                    "norm_country": norm_country if isinstance(norm_country, str) else ""
+                    "norm_name": norm_name,
+                    "norm_address": norm_addr,
+                    "norm_country": norm_country
                 }
-                
                 keys = self.extract_keys(item)
-                for key in keys:
-                    if key:
-                        self.inverted_index[key].append(ent_id)
+                global_idx = offset + idx
+                for k in keys:
+                    if k:
+                        key_builder[k].append(global_idx)
+                        
+            offset += len(df)
+            
+        self.target_entity_ids = np.concatenate(all_ids_list) if all_ids_list else np.array([], dtype=object)
+        
+        # Convert integer index lists to compact C-contiguous int32 arrays
+        self.inverted_index = {}
+        for k, v in key_builder.items():
+            if self.max_candidates_per_key and len(v) > self.max_candidates_per_key:
+                v = v[:self.max_candidates_per_key]
+            self.inverted_index[k] = np.array(v, dtype=np.int32)
+            
+        # Explicit garbage collection of temporary lists
+        del key_builder
+        del all_ids_list
+        gc.collect()
 
     def generate_candidates(self, s1_df: pd.DataFrame) -> Dict[str, Set[str]]:
         """
@@ -86,23 +114,33 @@ class BaseBlockingStrategy(ABC):
         country_col = "norm_country" if "norm_country" in s1_df.columns else "country"
         id_col = "entity_id"
         
-        for row in s1_df[[id_col, name_col, addr_col, country_col]].itertuples(index=False):
-            ent_id, norm_name, norm_addr, norm_country = row
-            
+        ids = s1_df[id_col].fillna("").astype(str).to_numpy()
+        names = s1_df[name_col].fillna("").astype(str).to_numpy()
+        addrs = s1_df[addr_col].fillna("").astype(str).to_numpy()
+        countries = s1_df[country_col].fillna("").astype(str).to_numpy()
+        
+        target_ids = self.target_entity_ids
+        
+        for ent_id, norm_name, norm_addr, norm_country in zip(ids, names, addrs, countries):
             item = {
                 "entity_id": ent_id,
-                "norm_name": norm_name if isinstance(norm_name, str) else "",
-                "norm_address": norm_addr if isinstance(norm_addr, str) else "",
-                "norm_country": norm_country if isinstance(norm_country, str) else ""
+                "norm_name": norm_name,
+                "norm_address": norm_addr,
+                "norm_country": norm_country
             }
             
             keys = self.extract_keys(item)
-            cand_set: Set[str] = set()
+            cand_idx_set: Set[int] = set()
             for key in keys:
                 if key in self.inverted_index:
-                    cand_set.update(self.inverted_index[key])
+                    cand_idx_set.update(self.inverted_index[key])
             
-            candidates[ent_id] = cand_set
+            if cand_idx_set:
+                cand_ids = {target_ids[idx] for idx in cand_idx_set}
+            else:
+                cand_ids = set()
+                
+            candidates[ent_id] = cand_ids
             
         return candidates
 
@@ -116,8 +154,8 @@ class ExactNameCountryBlocking(BaseBlockingStrategy):
     Strategy 1: Exact normalized business name + country.
     Blocks records that share identical normalized business names within the same country.
     """
-    def __init__(self):
-        super().__init__("Exact Normalized Name + Country")
+    def __init__(self, max_candidates_per_key: Optional[int] = None):
+        super().__init__("Exact Normalized Name + Country", max_candidates_per_key=max_candidates_per_key)
 
     def extract_keys(self, row: Any) -> List[str]:
         name = row["norm_name"]
@@ -132,8 +170,8 @@ class ExactAddressCountryBlocking(BaseBlockingStrategy):
     Strategy 2: Exact normalized address + country.
     Blocks records that share identical normalized addresses within the same country.
     """
-    def __init__(self):
-        super().__init__("Exact Normalized Address + Country")
+    def __init__(self, max_candidates_per_key: Optional[int] = None):
+        super().__init__("Exact Normalized Address + Country", max_candidates_per_key=max_candidates_per_key)
 
     def extract_keys(self, row: Any) -> List[str]:
         addr = row["norm_address"]
@@ -148,8 +186,8 @@ class NamePrefixCountryBlocking(BaseBlockingStrategy):
     Strategy 3: Normalized name prefix / token keys + country.
     Blocks records sharing the first N characters (e.g. 4) of normalized name + country.
     """
-    def __init__(self, prefix_length: int = 4):
-        super().__init__(f"Name Prefix ({prefix_length} chars) + Country")
+    def __init__(self, prefix_length: int = 4, max_candidates_per_key: Optional[int] = None):
+        super().__init__(f"Name Prefix ({prefix_length} chars) + Country", max_candidates_per_key=max_candidates_per_key)
         self.prefix_length = prefix_length
 
     def extract_keys(self, row: Any) -> List[str]:
@@ -168,8 +206,8 @@ class AddressDerivedCountryBlocking(BaseBlockingStrategy):
     Strategy 4: Address-derived keys + country.
     Blocks records sharing street number + street token key within the same country.
     """
-    def __init__(self):
-        super().__init__("Address-Derived Key + Country")
+    def __init__(self, max_candidates_per_key: Optional[int] = None):
+        super().__init__("Address-Derived Key + Country", max_candidates_per_key=max_candidates_per_key)
 
     def extract_keys(self, row: Any) -> List[str]:
         addr = row["norm_address"]
@@ -187,8 +225,8 @@ class CombinedSignalBlocking(BaseBlockingStrategy):
     Strategy 5: Combination of name/address signals.
     Creates composite blocking keys combining name prefix and address key within country.
     """
-    def __init__(self, prefix_length: int = 3):
-        super().__init__("Combined Name Prefix + Address Key + Country")
+    def __init__(self, prefix_length: int = 3, max_candidates_per_key: Optional[int] = None):
+        super().__init__("Combined Name Prefix + Address Key + Country", max_candidates_per_key=max_candidates_per_key)
         self.prefix_length = prefix_length
 
     def extract_keys(self, row: Any) -> List[str]:
@@ -217,7 +255,6 @@ def parse_ground_truth(gt_input: Any) -> Dict[str, Set[str]]:
     Accepts DataFrame, dict, or iterable of pairs.
     """
     if isinstance(gt_input, dict):
-        # Already a dict mapping s1_id -> set/list of match_ids
         return {k: set(v) if not isinstance(v, set) else v for k, v in gt_input.items()}
         
     gt_dict = defaultdict(set)
@@ -233,7 +270,6 @@ def parse_ground_truth(gt_input: Any) -> Dict[str, Set[str]]:
                 if pd.notna(s1_id) and pd.notna(match_id):
                     gt_dict[str(s1_id)].add(str(match_id))
         else:
-            # Fallback to first two columns
             s1_col, match_col = cols[0], cols[1]
             for s1_id, match_id in zip(gt_input[s1_col], gt_input[match_col]):
                 if pd.notna(s1_id) and pd.notna(match_id):
@@ -320,38 +356,15 @@ def evaluate_blocking_strategy(
 ) -> Dict[str, Any]:
     """
     Independently evaluate a single blocking strategy on validation data.
-    
-    Args:
-        strategy: Instance of BaseBlockingStrategy.
-        s1_df: Source 1 DataFrame.
-        target_dfs: List of target DataFrames (e.g. [s2_df, s3_df]).
-        ground_truth: Ground truth mapping or DataFrame.
-        
-    Returns:
-        Dict reporting:
-        - strategy_name
-        - num_validation_s1
-        - num_fully_recovered
-        - blocking_recall
-        - avg_candidates
-        - median_candidates
-        - max_candidates
-        - reduction_ratio
     """
-    # 1. Build strategy index
     strategy.build_index(target_dfs)
-    
-    # 2. Generate candidates for S1
     candidates = strategy.generate_candidates(s1_df)
     
-    # 3. Parse GT and calculate recall
     gt_dict = parse_ground_truth(ground_truth)
     num_val_s1, num_recovered, recall = evaluate_blocking_recall(candidates, gt_dict)
     
-    # 4. Calculate candidate statistics
     counts, avg_cand, median_cand, max_cand = calculate_candidate_stats(candidates)
     
-    # 5. Calculate reduction ratio
     num_s1 = len(s1_df)
     num_target_total = sum(len(df) for df in target_dfs)
     rr = calculate_reduction_ratio(candidates, num_s1, num_target_total)

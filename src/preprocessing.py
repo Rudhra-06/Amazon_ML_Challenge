@@ -243,6 +243,9 @@ def preprocess_dataframe(
     - 'norm_address'
     - 'norm_country'
     
+    Optimized for high throughput on multi-million row DataFrames by mapping
+    deterministic normalization over unique series values.
+    
     Args:
         df: Input DataFrame containing entity records.
         name_col: Column name for business name.
@@ -255,13 +258,23 @@ def preprocess_dataframe(
     """
     df_out = df.copy()
     
-    # Fill missing values gracefully
     raw_names = df_out[name_col].fillna("").astype(str)
     raw_addrs = df_out[addr_col].fillna("").astype(str)
     raw_countries = df_out[country_col].fillna("").astype(str)
     
-    df_out["norm_country"] = raw_countries.apply(normalize_country)
-    df_out["norm_name"] = raw_names.apply(lambda s: normalize_business_name(s, strip_legal=strip_legal))
-    df_out["norm_address"] = raw_addrs.apply(normalize_business_address)
+    # 1. Country normalization (map unique values)
+    unique_countries = raw_countries.unique()
+    country_map = {c: normalize_country(c) for c in unique_countries}
+    df_out["norm_country"] = raw_countries.map(country_map)
+    
+    # 2. Business name normalization (map unique values)
+    unique_names = raw_names.unique()
+    name_map = {n: normalize_business_name(n, strip_legal=strip_legal) for n in unique_names}
+    df_out["norm_name"] = raw_names.map(name_map)
+    
+    # 3. Business address normalization (map unique values)
+    unique_addrs = raw_addrs.unique()
+    addr_map = {a: normalize_business_address(a) for a in unique_addrs}
+    df_out["norm_address"] = raw_addrs.map(addr_map)
     
     return df_out
